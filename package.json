@@ -1,0 +1,20 @@
+{
+  "name": "17d_backend",
+  "version": "1.0.0",
+  "description": "",
+  "license": "ISC",
+  "author": "",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.1.0",
+    "axios": "^1.12.2",
+    "better-sqlite3": "^12.4.1",
+    "fastify": "^5.6.1",
+    "mqtt": "^5.14.1",
+    "sqlite3": "^5.1.7"
+  }
+}
