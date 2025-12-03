@@ -131,6 +131,7 @@ app.post("/download/interlock/csv", async (request, reply) => {
             'minute_th',
             'sensor_type',
             'sensor_id',
+            'operation_mode',
             'temp',
             'humid',
             'co2',
