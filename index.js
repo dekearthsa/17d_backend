@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS hlr_adjust_co2_setting(
     create_at INTEGER,
     update_at INTEGER,
     adjust_name TEXT,
+    is_active INTEGER, 
     after_exhausts_plus REAL,
     after_exhausts_multiplier REAL,
     after_exhausts_offset REAL,
@@ -81,15 +82,11 @@ const defaultAdjust = {
     interlock_4c_offset: 0.0,
 };
 
-function fetchSettingOrDefault(adjust_name = "default") {
-    if (adjust_name === "default") {
-        return defaultAdjust;
-    }
-    const sql = `SELECT * FROM hlr_adjust_co2_setting WHERE adjust_name = ? LIMIT 1`;
-    const row = db.prepare(sql).get(adjust_name);
+function fetchSettingOrDefault() {
+    const sql = `SELECT * FROM hlr_adjust_co2_setting WHERE is_active = 1 LIMIT 1`;
+    const row = db.prepare(sql).get();   // ไม่ส่งพารามิเตอร์
     return row || defaultAdjust;
 }
-
 // -----------------------------------------
 // 3) Fastify init
 // -----------------------------------------
@@ -107,14 +104,119 @@ app.get('/debug', async (request, reply) => {
     return { status: 'ok' }
 });
 
+// GET /get/setting_hlr  → ดึง preset ทั้งหมดออกมาแสดง
+app.get("/get/setting_hlr", async (request, reply) => {
+    try {
+        const rows = db
+            .prepare(
+                `
+        SELECT
+          id,
+          adjust_name,
+          is_active,
+          create_at,
+          update_at,
+          after_exhausts_plus,
+          after_exhausts_multiplier,
+          after_exhausts_offset,
+          before_exhaust_plus,
+          before_exhaust_multiplier,
+          before_exhaust_offset,
+          interlock_4c_plus,
+          interlock_4c_multiplier,
+          interlock_4c_offset
+        FROM hlr_adjust_co2_setting
+        ORDER BY adjust_name ASC, id ASC
+        `
+            )
+            .all();
+
+        return reply.send({
+            status: "ok",
+            data: rows,
+        });
+    } catch (err) {
+        request.log?.error(err);
+        return reply.code(500).send({
+            status: "error",
+            message: "internal server error",
+        });
+    }
+});
+
+
+
+// เปิด preset ให้ active เพียงตัวเดียว
+app.post("/adjust/active", async (request, reply) => {
+    try {
+        const body = request.body || {};
+        const adjust_name = (body.adjust_name || "").trim();
+
+        if (!adjust_name) {
+            return reply.code(400).send({
+                status: "fail",
+                message: "adjust_name is required",
+            });
+        }
+
+        // ตรวจว่ามี preset นี้จริงไหม
+        const existing = db.prepare(
+            `SELECT id FROM hlr_adjust_co2_setting WHERE adjust_name = ? LIMIT 1`
+        ).get(adjust_name);
+
+        if (!existing) {
+            return reply.code(404).send({
+                status: "fail",
+                message: `adjust_name "${adjust_name}" not found`,
+            });
+        }
+
+        const now = Date.now();
+
+        // ใช้ transaction ให้การเปลี่ยน active เป็น atomic
+        const activateTx = db.transaction((name) => {
+            // ปิด active ทั้งหมด
+            db.prepare(
+                `UPDATE hlr_adjust_co2_setting SET is_active = 0`
+            ).run();
+
+            // เปิด active ให้ตัวที่เลือก
+            db.prepare(
+                `UPDATE hlr_adjust_co2_setting
+                 SET is_active = 1, update_at = ?
+                 WHERE adjust_name = ?`
+            ).run(now, name);
+        });
+
+        activateTx(adjust_name);
+
+        const active = db.prepare(
+            `SELECT * FROM hlr_adjust_co2_setting WHERE adjust_name = ? LIMIT 1`
+        ).get(adjust_name);
+
+        return reply.send({
+            status: "ok",
+            message: `set "${adjust_name}" as active preset`,
+            data: active,
+        });
+
+    } catch (err) {
+        request.log?.error(err);
+        return reply.code(500).send({
+            status: "error",
+            message: "internal server error",
+        });
+    }
+});
+
+
 // -----------------------------------------
 // 4) POST /update/setting_adjust  (upsert)
 // -----------------------------------------
 app.post("/update/setting_adjust", async (request, reply) => {
     try {
         const body = request.body || {};
-
-        const adjust_name = body.adjust_name || "default";
+        const adjust_name = (body.adjust_name || "default").trim();
 
         const payload = {
             adjust_name,
@@ -131,73 +233,87 @@ app.post("/update/setting_adjust", async (request, reply) => {
 
         const now = Date.now();
 
-        // มี row นี้อยู่แล้วหรือยัง
         const existing = db.prepare(
-            `SELECT id FROM hlr_adjust_co2_setting WHERE adjust_name = ? LIMIT 1`
+            `SELECT * FROM hlr_adjust_co2_setting WHERE adjust_name = ? LIMIT 1`
         ).get(adjust_name);
 
         if (existing) {
-            const current = db.prepare(
-                `SELECT * FROM hlr_adjust_co2_setting WHERE id = ?`
-            ).get(existing.id);
-
             const stmt = db.prepare(`
-                UPDATE hlr_adjust_co2_setting SET
-                    update_at = @update_at,
-                    after_exhausts_plus       = @after_exhausts_plus,
-                    after_exhausts_multiplier = @after_exhausts_multiplier,
-                    after_exhausts_offset     = @after_exhausts_offset,
-                    before_exhaust_plus       = @before_exhaust_plus,
-                    before_exhaust_multiplier = @before_exhaust_multiplier,
-                    before_exhaust_offset     = @before_exhaust_offset,
-                    interlock_4c_plus         = @interlock_4c_plus,
-                    interlock_4c_multiplier   = @interlock_4c_multiplier,
-                    interlock_4c_offset       = @interlock_4c_offset
-                WHERE id = @id
-            `);
+        UPDATE hlr_adjust_co2_setting SET
+          update_at = @update_at,
+          after_exhausts_plus       = @after_exhausts_plus,
+          after_exhausts_multiplier = @after_exhausts_multiplier,
+          after_exhausts_offset     = @after_exhausts_offset,
+          before_exhaust_plus       = @before_exhaust_plus,
+          before_exhaust_multiplier = @before_exhaust_multiplier,
+          before_exhaust_offset     = @before_exhaust_offset,
+          interlock_4c_plus         = @interlock_4c_plus,
+          interlock_4c_multiplier   = @interlock_4c_multiplier,
+          interlock_4c_offset       = @interlock_4c_offset
+        WHERE id = @id
+      `);
 
             stmt.run({
                 id: existing.id,
                 update_at: now,
-                after_exhausts_plus: payload.after_exhausts_plus ?? current.after_exhausts_plus,
-                after_exhausts_multiplier: payload.after_exhausts_multiplier ?? current.after_exhausts_multiplier,
-                after_exhausts_offset: payload.after_exhausts_offset ?? current.after_exhausts_offset,
-                before_exhaust_plus: payload.before_exhaust_plus ?? current.before_exhaust_plus,
-                before_exhaust_multiplier: payload.before_exhaust_multiplier ?? current.before_exhaust_multiplier,
-                before_exhaust_offset: payload.before_exhaust_offset ?? current.before_exhaust_offset,
-                interlock_4c_plus: payload.interlock_4c_plus ?? current.interlock_4c_plus,
-                interlock_4c_multiplier: payload.interlock_4c_multiplier ?? current.interlock_4c_multiplier,
-                interlock_4c_offset: payload.interlock_4c_offset ?? current.interlock_4c_offset,
+                after_exhausts_plus:
+                    payload.after_exhausts_plus ?? existing.after_exhausts_plus,
+                after_exhausts_multiplier:
+                    payload.after_exhausts_multiplier ?? existing.after_exhausts_multiplier,
+                after_exhausts_offset:
+                    payload.after_exhausts_offset ?? existing.after_exhausts_offset,
+                before_exhaust_plus:
+                    payload.before_exhaust_plus ?? existing.before_exhaust_plus,
+                before_exhaust_multiplier:
+                    payload.before_exhaust_multiplier ?? existing.before_exhaust_multiplier,
+                before_exhaust_offset:
+                    payload.before_exhaust_offset ?? existing.before_exhaust_offset,
+                interlock_4c_plus:
+                    payload.interlock_4c_plus ?? existing.interlock_4c_plus,
+                interlock_4c_multiplier:
+                    payload.interlock_4c_multiplier ?? existing.interlock_4c_multiplier,
+                interlock_4c_offset:
+                    payload.interlock_4c_offset ?? existing.interlock_4c_offset,
             });
-
         } else {
             const stmt = db.prepare(`
-                INSERT INTO hlr_adjust_co2_setting(
-                    create_at, update_at, adjust_name,
-                    after_exhausts_plus, after_exhausts_multiplier, after_exhausts_offset,
-                    before_exhaust_plus, before_exhaust_multiplier, before_exhaust_offset,
-                    interlock_4c_plus, interlock_4c_multiplier, interlock_4c_offset
-                ) VALUES (
-                    @create_at, @update_at, @adjust_name,
-                    @after_exhausts_plus, @after_exhausts_multiplier, @after_exhausts_offset,
-                    @before_exhaust_plus, @before_exhaust_multiplier, @before_exhaust_offset,
-                    @interlock_4c_plus, @interlock_4c_multiplier, @interlock_4c_offset
-                )
-            `);
+        INSERT INTO hlr_adjust_co2_setting(
+          create_at, update_at, adjust_name, is_active,
+          after_exhausts_plus, after_exhausts_multiplier, after_exhausts_offset,
+          before_exhaust_plus, before_exhaust_multiplier, before_exhaust_offset,
+          interlock_4c_plus, interlock_4c_multiplier, interlock_4c_offset
+        ) VALUES (
+          @create_at, @update_at, @adjust_name, @is_active,
+          @after_exhausts_plus, @after_exhausts_multiplier, @after_exhausts_offset,
+          @before_exhaust_plus, @before_exhaust_multiplier, @before_exhaust_offset,
+          @interlock_4c_plus, @interlock_4c_multiplier, @interlock_4c_offset
+        )
+      `);
 
             stmt.run({
                 create_at: now,
                 update_at: now,
                 adjust_name,
-                after_exhausts_plus: payload.after_exhausts_plus ?? defaultAdjust.after_exhausts_plus,
-                after_exhausts_multiplier: payload.after_exhausts_multiplier ?? defaultAdjust.after_exhausts_multiplier,
-                after_exhausts_offset: payload.after_exhausts_offset ?? defaultAdjust.after_exhausts_offset,
-                before_exhaust_plus: payload.before_exhaust_plus ?? defaultAdjust.before_exhaust_plus,
-                before_exhaust_multiplier: payload.before_exhaust_multiplier ?? defaultAdjust.before_exhaust_multiplier,
-                before_exhaust_offset: payload.before_exhaust_offset ?? defaultAdjust.before_exhaust_offset,
-                interlock_4c_plus: payload.interlock_4c_plus ?? defaultAdjust.interlock_4c_plus,
-                interlock_4c_multiplier: payload.interlock_4c_multiplier ?? defaultAdjust.interlock_4c_multiplier,
-                interlock_4c_offset: payload.interlock_4c_offset ?? defaultAdjust.interlock_4c_offset,
+                is_active: 0, // default: สร้างมาแต่ยังไม่ active
+
+                after_exhausts_plus:
+                    payload.after_exhausts_plus ?? defaultAdjust.after_exhausts_plus,
+                after_exhausts_multiplier:
+                    payload.after_exhausts_multiplier ?? defaultAdjust.after_exhausts_multiplier,
+                after_exhausts_offset:
+                    payload.after_exhausts_offset ?? defaultAdjust.after_exhausts_offset,
+                before_exhaust_plus:
+                    payload.before_exhaust_plus ?? defaultAdjust.before_exhaust_plus,
+                before_exhaust_multiplier:
+                    payload.before_exhaust_multiplier ?? defaultAdjust.before_exhaust_multiplier,
+                before_exhaust_offset:
+                    payload.before_exhaust_offset ?? defaultAdjust.before_exhaust_offset,
+                interlock_4c_plus:
+                    payload.interlock_4c_plus ?? defaultAdjust.interlock_4c_plus,
+                interlock_4c_multiplier:
+                    payload.interlock_4c_multiplier ?? defaultAdjust.interlock_4c_multiplier,
+                interlock_4c_offset:
+                    payload.interlock_4c_offset ?? defaultAdjust.interlock_4c_offset,
             });
         }
 
@@ -219,6 +335,8 @@ app.post("/update/setting_adjust", async (request, reply) => {
         });
     }
 });
+
+
 
 // -----------------------------------------
 // 5) POST /adjust/usage  (log history)
@@ -351,8 +469,8 @@ app.post("/download/interlock/csv", async (request, reply) => {
 // 8) POST /loop/data/iaq
 // -----------------------------------------
 app.post('/loop/data/iaq', async (request, reply) => {
-    const { start, latesttime, rangeSelected, adjustName } = request.body || {};
-    const adjust = fetchSettingOrDefault(adjustName);
+    const { start, latesttime, rangeSelected } = request.body || {};
+    const adjust = fetchSettingOrDefault();
 
     const MERGED_CTE = `
         WITH merged AS (
@@ -395,9 +513,9 @@ app.post('/loop/data/iaq', async (request, reply) => {
                     sensor_id,
                     operation_mode AS mode,
                     CASE
-                        WHEN sensor_id = 'after_exhausts'
+                        WHEN sensor_id = 'after_scrub'
                             THEN (${adjust.after_exhausts_plus} + (${adjust.after_exhausts_multiplier} * co2)) + ${adjust.after_exhausts_offset}
-                        WHEN sensor_id = 'before_exhaust'
+                        WHEN sensor_id = 'before_scrub'
                             THEN (${adjust.before_exhaust_plus} + (${adjust.before_exhaust_multiplier} * co2)) + ${adjust.before_exhaust_offset}
                         WHEN sensor_id = 'interlock_4c'
                             THEN (${adjust.interlock_4c_plus} + (${adjust.interlock_4c_multiplier} * co2)) + ${adjust.interlock_4c_offset}
@@ -415,7 +533,6 @@ app.post('/loop/data/iaq', async (request, reply) => {
 
         } else {
             if (rangeSelected >= 60400000) {
-                // bin 3 นาที
                 sql = `
                     ${MERGED_CTE}
                     SELECT
@@ -425,9 +542,9 @@ app.post('/loop/data/iaq', async (request, reply) => {
                         operation_mode AS mode,
                         AVG(
                             CASE
-                                WHEN sensor_id = 'after_exhausts'
+                                WHEN sensor_id = 'after_scrub'
                                     THEN (${adjust.after_exhausts_plus} + (${adjust.after_exhausts_multiplier} * co2)) + ${adjust.after_exhausts_offset}
-                                WHEN sensor_id = 'before_exhaust'
+                                WHEN sensor_id = 'before_scrub'
                                     THEN (${adjust.before_exhaust_plus} + (${adjust.before_exhaust_multiplier} * co2)) + ${adjust.before_exhaust_offset}
                                 WHEN sensor_id = 'interlock_4c'
                                     THEN (${adjust.interlock_4c_plus} + (${adjust.interlock_4c_multiplier} * co2)) + ${adjust.interlock_4c_offset}
@@ -446,7 +563,6 @@ app.post('/loop/data/iaq', async (request, reply) => {
                 param = start;
 
             } else if (rangeSelected >= 43200000) {
-                // bin 1 นาที
                 sql = `
                     ${MERGED_CTE}
                     SELECT
@@ -456,9 +572,9 @@ app.post('/loop/data/iaq', async (request, reply) => {
                         operation_mode AS mode,
                         AVG(
                             CASE
-                                WHEN sensor_id = 'after_exhausts'
+                                WHEN sensor_id = 'after_scrub'
                                     THEN (${adjust.after_exhausts_plus} + (${adjust.after_exhausts_multiplier} * co2)) + ${adjust.after_exhausts_offset}
-                                WHEN sensor_id = 'before_exhaust'
+                                WHEN sensor_id = 'before_scrub'
                                     THEN (${adjust.before_exhaust_plus} + (${adjust.before_exhaust_multiplier} * co2)) + ${adjust.before_exhaust_offset}
                                 WHEN sensor_id = 'interlock_4c'
                                     THEN (${adjust.interlock_4c_plus} + (${adjust.interlock_4c_multiplier} * co2)) + ${adjust.interlock_4c_offset}
@@ -477,7 +593,6 @@ app.post('/loop/data/iaq', async (request, reply) => {
                 param = start;
 
             } else {
-                // ไม่ bin เวลา
                 sql = `
                     ${MERGED_CTE}
                     SELECT
@@ -487,9 +602,9 @@ app.post('/loop/data/iaq', async (request, reply) => {
                         operation_mode AS mode,
                         AVG(
                             CASE
-                                WHEN sensor_id = 'after_exhausts'
+                                WHEN sensor_id = 'after_scrub'
                                     THEN (${adjust.after_exhausts_plus} + (${adjust.after_exhausts_multiplier} * co2)) + ${adjust.after_exhausts_offset}
-                                WHEN sensor_id = 'before_exhaust'
+                                WHEN sensor_id = 'before_scrub'
                                     THEN (${adjust.before_exhaust_plus} + (${adjust.before_exhaust_multiplier} * co2)) + ${adjust.before_exhaust_offset}
                                 WHEN sensor_id = 'interlock_4c'
                                     THEN (${adjust.interlock_4c_plus} + (${adjust.interlock_4c_multiplier} * co2)) + ${adjust.interlock_4c_offset}
@@ -521,7 +636,6 @@ app.post('/loop/data/iaq', async (request, reply) => {
         reply.status(500).send({ error: 'Internal server error' });
     }
 });
-
 // -----------------------------------------
 // 9) start server
 // -----------------------------------------
