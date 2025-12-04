@@ -48,6 +48,61 @@ dbPromise.then(async (db) => {
     console.error('Failed to initialize database:', err)
 })
 
+dbPromise.then(async (db) => {
+    await db.exec(`CREATE TABLE IF NOT EXISTS hlr_adjust_co2_setting(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        create_at INTEGER,
+        update_at INTEGER,
+        adjust_name TEXT,
+        after_exhausts_plus REAL,
+        after_exhausts_multiplier REAL,
+        after_exhausts_offset REAL,
+        before_exhaust_plus REAL,
+        before_exhaust_multiplier REAL,
+        before_exhaust_offset REAL,
+        interlock_4c_plus REAL,
+        interlock_4c_multiplier REAL,
+        interlock_4c_offset REAL
+    )`)
+})
+
+dbPromise.then(async (db) => {
+    await db.exec(`CREATE TABLE IF NOT EXISTS hlr_adjust_usage_history(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        adjust_name TEXT,
+        cyclicName TEXT,
+        start_at INTEGER,
+        end_at INTEGER
+    )`)
+})
+
+
+const defaultAdjust = {
+    adjust_name: "default",
+    after_exhausts_plus: 52.831276,
+    after_exhausts_multiplier: 1.06400140,
+    after_exhausts_offset: 0.0,
+    before_exhaust_plus: 55.215733,
+    before_exhaust_multiplier: 1.072297996,
+    before_exhaust_offset: 0.0,
+    interlock_4c_plus: 16.238157,
+    interlock_4c_multiplier: 1.048766343,
+    interlock_4c_offset: 0.0,
+};
+
+function fetchSettingOrDefault(adjust_name = "default") {
+    if (adjust_name === "default") {
+        return defaultAdjust
+    } else {
+        const sql = `SELECT * FROM hlr_adjust_co2_setting WHERE adjust_name = ? LIMIT 1`;
+        const row = db.prepare(sql).get(adjust_name);   // ใช้ get() ถ้าจะเอาแค่หนึ่ง row
+        return row || defaultAdjust;  // ← fallback ใช้งานตรง
+    }
+
+}
+
+
+
 const app = Fastify({
     logger: {
         level: "error"
@@ -153,9 +208,9 @@ app.post("/download/interlock/csv", async (request, reply) => {
 })
 
 app.post('/loop/data/iaq', async (request, reply) => {
-    const { start, latesttime, rangeSelected } = request.body;
+    const { start, latesttime, rangeSelected, adjustName } = request.body;
     const db = new Database('./hlr_db.db');
-
+    const adjust = fetchSettingOrDefault(adjustName)
     // CTE รวม 2 table ให้เป็นโครงเดียวกัน
     const MERGED_CTE = `
         WITH merged AS (
@@ -201,9 +256,9 @@ app.post('/loop/data/iaq', async (request, reply) => {
                     sensor_id,
                     operation_mode AS mode,
                     CASE
-                        WHEN sensor_id = 'after_exhausts' THEN 52.831276 + (1.06400140 * co2)
-                        WHEN sensor_id = 'before_exhaust' THEN 55.215733 + (1.072297996 * co2)
-                        WHEN sensor_id = 'interlock_4c' THEN 16.238157 + (1.048766343 * co2)
+                        WHEN sensor_id = 'after_exhausts' THEN (${adjust.after_exhausts_plus} + (${adjust.after_exhausts_multiplier} * co2))+${adjust.after_exhausts_offset}
+                        WHEN sensor_id = 'before_exhaust' THEN (${adjust.before_exhausts_plus}  + (${adjust.before_exhaust_multiplier}* co2))+${adjust.before_exhaust_offset}
+                        WHEN sensor_id = 'interlock_4c' THEN (${adjust.interlock_4c_plus} + (${adjust.interlock_4c_multiplier} * co2))+${adjust.interlock_4c_offset}
                         ELSE 0
                     END AS co2,
                     humid AS humidity,
@@ -231,9 +286,9 @@ app.post('/loop/data/iaq', async (request, reply) => {
                         operation_mode AS mode,
                         AVG(
                             CASE
-                                WHEN sensor_id = 'after_exhausts' THEN 52.831276 + (1.06400140 * co2)
-                                WHEN sensor_id = 'before_exhaust' THEN 55.215733 + (1.072297996 * co2)
-                                WHEN sensor_id = 'interlock_4c' THEN 16.238157 + (1.048766343 * co2)
+                                WHEN sensor_id = 'after_exhausts' THEN (${adjust.after_exhausts_plus} + (${adjust.after_exhausts_multiplier} * co2))+${adjust.after_exhausts_offset}
+                                WHEN sensor_id = 'before_exhaust' THEN (${adjust.before_exhausts_plus}  + (${adjust.before_exhaust_multiplier}* co2))+${adjust.before_exhaust_offset}
+                                WHEN sensor_id = 'interlock_4c' THEN (${adjust.interlock_4c_plus} + (${adjust.interlock_4c_multiplier} * co2))+${adjust.interlock_4c_offset}
                                 ELSE 0
                             END
                         ) AS co2,
@@ -263,9 +318,9 @@ app.post('/loop/data/iaq', async (request, reply) => {
                         operation_mode AS mode,
                         AVG(
                             CASE
-                                WHEN sensor_id = 'after_exhausts' THEN 52.831276 + (1.06400140 * co2)
-                                WHEN sensor_id = 'before_exhaust' THEN 55.215733 + (1.072297996 * co2)
-                                WHEN sensor_id = 'interlock_4c' THEN 16.238157 + (1.048766343 * co2)
+                                WHEN sensor_id = 'after_exhausts' THEN (${adjust.after_exhausts_plus} + (${adjust.after_exhausts_multiplier} * co2))+${adjust.after_exhausts_offset}
+                                WHEN sensor_id = 'before_exhaust' THEN (${adjust.before_exhausts_plus}  + (${adjust.before_exhaust_multiplier}* co2))+${adjust.before_exhaust_offset}
+                                WHEN sensor_id = 'interlock_4c' THEN (${adjust.interlock_4c_plus} + (${adjust.interlock_4c_multiplier} * co2))+${adjust.interlock_4c_offset}
                                 ELSE 0
                             END
                         ) AS co2,
@@ -295,9 +350,9 @@ app.post('/loop/data/iaq', async (request, reply) => {
                         operation_mode AS mode,
                         AVG(
                             CASE
-                                WHEN sensor_id = 'after_exhausts' THEN 52.831276 + (1.06400140 * co2)
-                                WHEN sensor_id = 'before_exhaust' THEN 55.215733 + (1.072297996 * co2)
-                                WHEN sensor_id = 'interlock_4c' THEN 16.238157 + (1.048766343 * co2)
+                                WHEN sensor_id = 'after_exhausts' THEN (${adjust.after_exhausts_plus} + (${adjust.after_exhausts_multiplier} * co2))+${adjust.after_exhausts_offset}
+                                WHEN sensor_id = 'before_exhaust' THEN (${adjust.before_exhausts_plus}  + (${adjust.before_exhaust_multiplier}* co2))+${adjust.before_exhaust_offset}
+                                WHEN sensor_id = 'interlock_4c' THEN (${adjust.interlock_4c_plus} + (${adjust.interlock_4c_multiplier} * co2))+${adjust.interlock_4c_offset}
                                 ELSE 0
                             END
                         ) AS co2,
