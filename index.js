@@ -1,82 +1,73 @@
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
-import sqlite3 from 'sqlite3'
 import Database from 'better-sqlite3';
 import { Parser } from 'json2csv'
 import fs from 'fs'
 import path from 'path'
 
-// Initialize SQLite database
-const dbPromise = new Promise((resolve, reject) => {
-    const db = new sqlite3.Database('./hlr_db.db', (err) => {
-        if (err) {
-            return reject(err)
-        }
-        resolve(db)
-    })
-})
+// -----------------------------------------
+// 1) เปิด DB ด้วย better-sqlite3 เพียงตัวเดียว
+// -----------------------------------------
+const db = new Database('./hlr_db.db');
 
-dbPromise.then(async (db) => {
-    await db.exec(`CREATE TABLE IF NOT EXISTS sensor_data_exhaust(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sensor_id TEXT,
-        sensor_type TEXT, 
-        timestamp INTEGER,
-        temp REAL,
-        humid REAL,
-        co2 REAL
-    )`)
-}).catch(err => {
-    console.error('Failed to initialize database:', err)
-})
+// สร้างตาราง (exec เป็น sync ไม่ต้อง await)
+db.exec(`
+CREATE TABLE IF NOT EXISTS sensor_data_exhaust(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sensor_id TEXT,
+    sensor_type TEXT, 
+    timestamp INTEGER,
+    temp REAL,
+    humid REAL,
+    co2 REAL
+);
+`);
 
-dbPromise.then(async (db) => {
-    await db.exec(`CREATE TABLE IF NOT EXISTS sensor_data_interlock(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sensor_id TEXT,
-        timestamp INTEGER,
-        sensor_type TEXT, 
-        temp REAL,
-        humid REAL,
-        co2 REAL,
-        operation_mode INTEGER, 
-        temp_before_filter REAL,
-        fan_speed INTEGER,
-        voc REAL
-    )`)
-}).catch(err => {
-    console.error('Failed to initialize database:', err)
-})
+db.exec(`
+CREATE TABLE IF NOT EXISTS sensor_data_interlock(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sensor_id TEXT,
+    timestamp INTEGER,
+    sensor_type TEXT, 
+    temp REAL,
+    humid REAL,
+    co2 REAL,
+    operation_mode INTEGER, 
+    temp_before_filter REAL,
+    fan_speed INTEGER,
+    voc REAL
+);
+`);
 
-dbPromise.then(async (db) => {
-    await db.exec(`CREATE TABLE IF NOT EXISTS hlr_adjust_co2_setting(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        create_at INTEGER,
-        update_at INTEGER,
-        adjust_name TEXT,
-        after_exhausts_plus REAL,
-        after_exhausts_multiplier REAL,
-        after_exhausts_offset REAL,
-        before_exhaust_plus REAL,
-        before_exhaust_multiplier REAL,
-        before_exhaust_offset REAL,
-        interlock_4c_plus REAL,
-        interlock_4c_multiplier REAL,
-        interlock_4c_offset REAL
-    )`)
-})
+db.exec(`
+CREATE TABLE IF NOT EXISTS hlr_adjust_co2_setting(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    create_at INTEGER,
+    update_at INTEGER,
+    adjust_name TEXT,
+    after_exhausts_plus REAL,
+    after_exhausts_multiplier REAL,
+    after_exhausts_offset REAL,
+    before_exhaust_plus REAL,
+    before_exhaust_multiplier REAL,
+    before_exhaust_offset REAL,
+    interlock_4c_plus REAL,
+    interlock_4c_multiplier REAL,
+    interlock_4c_offset REAL
+);
+`);
 
-dbPromise.then(async (db) => {
-    await db.exec(`CREATE TABLE IF NOT EXISTS hlr_adjust_usage_history(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        adjust_name TEXT,
-        cyclicName TEXT,
-        start_at INTEGER,
-        end_at INTEGER
-    )`)
-})
+db.exec(`
+CREATE TABLE IF NOT EXISTS hlr_adjust_usage_history(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    adjust_name TEXT,
+    timestamp INTEGER
+);
+`);
 
-
+// -----------------------------------------
+// 2) default adjust config
+// -----------------------------------------
 const defaultAdjust = {
     adjust_name: "default",
     after_exhausts_plus: 52.831276,
@@ -92,49 +83,201 @@ const defaultAdjust = {
 
 function fetchSettingOrDefault(adjust_name = "default") {
     if (adjust_name === "default") {
-        return defaultAdjust
-    } else {
-        const sql = `SELECT * FROM hlr_adjust_co2_setting WHERE adjust_name = ? LIMIT 1`;
-        const row = db.prepare(sql).get(adjust_name);   // ใช้ get() ถ้าจะเอาแค่หนึ่ง row
-        return row || defaultAdjust;  // ← fallback ใช้งานตรง
+        return defaultAdjust;
     }
-
+    const sql = `SELECT * FROM hlr_adjust_co2_setting WHERE adjust_name = ? LIMIT 1`;
+    const row = db.prepare(sql).get(adjust_name);
+    return row || defaultAdjust;
 }
 
-
-
+// -----------------------------------------
+// 3) Fastify init
+// -----------------------------------------
 const app = Fastify({
     logger: {
         level: "error"
     }
 });
+
 app.register(cors, {
     origin: '*'
-})
+});
 
 app.get('/debug', async (request, reply) => {
     return { status: 'ok' }
 });
 
+// -----------------------------------------
+// 4) POST /update/setting_adjust  (upsert)
+// -----------------------------------------
+app.post("/update/setting_adjust", async (request, reply) => {
+    try {
+        const body = request.body || {};
+
+        const adjust_name = body.adjust_name || "default";
+
+        const payload = {
+            adjust_name,
+            after_exhausts_plus: body.after_exhausts_plus,
+            after_exhausts_multiplier: body.after_exhausts_multiplier,
+            after_exhausts_offset: body.after_exhausts_offset,
+            before_exhaust_plus: body.before_exhaust_plus,
+            before_exhaust_multiplier: body.before_exhaust_multiplier,
+            before_exhaust_offset: body.before_exhaust_offset,
+            interlock_4c_plus: body.interlock_4c_plus,
+            interlock_4c_multiplier: body.interlock_4c_multiplier,
+            interlock_4c_offset: body.interlock_4c_offset,
+        };
+
+        const now = Date.now();
+
+        // มี row นี้อยู่แล้วหรือยัง
+        const existing = db.prepare(
+            `SELECT id FROM hlr_adjust_co2_setting WHERE adjust_name = ? LIMIT 1`
+        ).get(adjust_name);
+
+        if (existing) {
+            const current = db.prepare(
+                `SELECT * FROM hlr_adjust_co2_setting WHERE id = ?`
+            ).get(existing.id);
+
+            const stmt = db.prepare(`
+                UPDATE hlr_adjust_co2_setting SET
+                    update_at = @update_at,
+                    after_exhausts_plus       = @after_exhausts_plus,
+                    after_exhausts_multiplier = @after_exhausts_multiplier,
+                    after_exhausts_offset     = @after_exhausts_offset,
+                    before_exhaust_plus       = @before_exhaust_plus,
+                    before_exhaust_multiplier = @before_exhaust_multiplier,
+                    before_exhaust_offset     = @before_exhaust_offset,
+                    interlock_4c_plus         = @interlock_4c_plus,
+                    interlock_4c_multiplier   = @interlock_4c_multiplier,
+                    interlock_4c_offset       = @interlock_4c_offset
+                WHERE id = @id
+            `);
+
+            stmt.run({
+                id: existing.id,
+                update_at: now,
+                after_exhausts_plus: payload.after_exhausts_plus ?? current.after_exhausts_plus,
+                after_exhausts_multiplier: payload.after_exhausts_multiplier ?? current.after_exhausts_multiplier,
+                after_exhausts_offset: payload.after_exhausts_offset ?? current.after_exhausts_offset,
+                before_exhaust_plus: payload.before_exhaust_plus ?? current.before_exhaust_plus,
+                before_exhaust_multiplier: payload.before_exhaust_multiplier ?? current.before_exhaust_multiplier,
+                before_exhaust_offset: payload.before_exhaust_offset ?? current.before_exhaust_offset,
+                interlock_4c_plus: payload.interlock_4c_plus ?? current.interlock_4c_plus,
+                interlock_4c_multiplier: payload.interlock_4c_multiplier ?? current.interlock_4c_multiplier,
+                interlock_4c_offset: payload.interlock_4c_offset ?? current.interlock_4c_offset,
+            });
+
+        } else {
+            const stmt = db.prepare(`
+                INSERT INTO hlr_adjust_co2_setting(
+                    create_at, update_at, adjust_name,
+                    after_exhausts_plus, after_exhausts_multiplier, after_exhausts_offset,
+                    before_exhaust_plus, before_exhaust_multiplier, before_exhaust_offset,
+                    interlock_4c_plus, interlock_4c_multiplier, interlock_4c_offset
+                ) VALUES (
+                    @create_at, @update_at, @adjust_name,
+                    @after_exhausts_plus, @after_exhausts_multiplier, @after_exhausts_offset,
+                    @before_exhaust_plus, @before_exhaust_multiplier, @before_exhaust_offset,
+                    @interlock_4c_plus, @interlock_4c_multiplier, @interlock_4c_offset
+                )
+            `);
+
+            stmt.run({
+                create_at: now,
+                update_at: now,
+                adjust_name,
+                after_exhausts_plus: payload.after_exhausts_plus ?? defaultAdjust.after_exhausts_plus,
+                after_exhausts_multiplier: payload.after_exhausts_multiplier ?? defaultAdjust.after_exhausts_multiplier,
+                after_exhausts_offset: payload.after_exhausts_offset ?? defaultAdjust.after_exhausts_offset,
+                before_exhaust_plus: payload.before_exhaust_plus ?? defaultAdjust.before_exhaust_plus,
+                before_exhaust_multiplier: payload.before_exhaust_multiplier ?? defaultAdjust.before_exhaust_multiplier,
+                before_exhaust_offset: payload.before_exhaust_offset ?? defaultAdjust.before_exhaust_offset,
+                interlock_4c_plus: payload.interlock_4c_plus ?? defaultAdjust.interlock_4c_plus,
+                interlock_4c_multiplier: payload.interlock_4c_multiplier ?? defaultAdjust.interlock_4c_multiplier,
+                interlock_4c_offset: payload.interlock_4c_offset ?? defaultAdjust.interlock_4c_offset,
+            });
+        }
+
+        const saved = db.prepare(
+            `SELECT * FROM hlr_adjust_co2_setting WHERE adjust_name = ? LIMIT 1`
+        ).get(adjust_name);
+
+        return reply.send({
+            status: "ok",
+            message: "updated setting_adjust successfully",
+            data: saved,
+        });
+
+    } catch (err) {
+        request.log?.error(err);
+        return reply.code(500).send({
+            status: "error",
+            message: "internal server error",
+        });
+    }
+});
+
+// -----------------------------------------
+// 5) POST /adjust/usage  (log history)
+// -----------------------------------------
+app.post("/adjust/usage", async (request, reply) => {
+    try {
+        const body = request.body || {};
+        const adjust_name = body.adjust_name || "default";
+        const now = Date.now();
+
+        const stmt = db.prepare(`
+            INSERT INTO hlr_adjust_usage_history (adjust_name, timestamp)
+            VALUES (@adjust_name, @timestamp)
+        `);
+
+        const info = stmt.run({
+            adjust_name,
+            timestamp: now,
+        });
+
+        return reply.send({
+            status: "ok",
+            message: "logged adjust usage",
+            data: {
+                id: info.lastInsertRowid,
+                adjust_name,
+                timestamp: now,
+            },
+        });
+    } catch (err) {
+        request.log?.error(err);
+        return reply.code(500).send({
+            status: "error",
+            message: "internal server error",
+        });
+    }
+});
+
+// -----------------------------------------
+// 6) POST /download/tongdy/csv
+// -----------------------------------------
 app.post("/download/tongdy/csv", async (request, reply) => {
-    const { startMs, endMs } = request.body;
-    if (!startMs) return reply.status(400).send("Invalid payload");
-    if (!endMs) return reply.status(400).send("Invalid payload");
-    const db = new Database('./hlr_db.db')
+    const { startMs, endMs } = request.body || {};
+    if (!startMs || !endMs) return reply.status(400).send("Invalid payload");
+
     const query = `
-                SELECT
-                    strftime('%Y-%m-%d %H:%M:00', timestamp/1000, 'unixepoch', '+7 hours') AS minute_th,
-                    sensor_type,
-                    sensor_id,
-                    AVG(temp) AS temp,
-                    AVG(humid) AS humid,
-                    AVG(co2) AS co2
-                FROM sensor_data_exhaust
-                WHERE timestamp BETWEEN ? AND ?
-                GROUP BY minute_th, sensor_type;
-                `
+        SELECT
+            strftime('%Y-%m-%d %H:%M:00', timestamp/1000, 'unixepoch', '+7 hours') AS minute_th,
+            sensor_type,
+            sensor_id,
+            AVG(temp) AS temp,
+            AVG(humid) AS humid,
+            AVG(co2) AS co2
+        FROM sensor_data_exhaust
+        WHERE timestamp BETWEEN ? AND ?
+        GROUP BY minute_th, sensor_type, sensor_id;
+    `;
     const rows = db.prepare(query).all(startMs, endMs);
-    // console.log(rows);
+
     const parser = new Parser({
         fields: [
             'minute_th',
@@ -147,40 +290,39 @@ app.post("/download/tongdy/csv", async (request, reply) => {
     });
     const csv = parser.parse(rows);
 
-    // --- ตั้งชื่อไฟล์และเขียนชั่วคราว ---
     const filename = `sensor_tongdy_avg_1min_${Date.now()}.csv`;
     const filepath = path.join('./', filename);
     fs.writeFileSync(filepath, csv);
 
-    // --- ส่งออกเป็นไฟล์ให้โหลด ---
     reply.header('Content-Type', 'text/csv');
     reply.header('Content-Disposition', `attachment; filename="${filename}"`);
     return reply.send(fs.createReadStream(filepath));
-    // return reply.status(200).send(rows)
-})
+});
 
+// -----------------------------------------
+// 7) POST /download/interlock/csv
+// -----------------------------------------
 app.post("/download/interlock/csv", async (request, reply) => {
-    const { startMs, endMs } = request.body;
-    if (!startMs) return reply.status(400).send("Invalid payload");
-    if (!endMs) return reply.status(400).send("Invalid payload");
-    const db = new Database('./hlr_db.db')
+    const { startMs, endMs } = request.body || {};
+    if (!startMs || !endMs) return reply.status(400).send("Invalid payload");
+
     const query = `
-                SELECT
-                    strftime('%Y-%m-%d %H:%M:00', timestamp/1000, 'unixepoch', '+7 hours') AS minute_th,
-                    sensor_type,
-                    sensor_id,
-                    operation_mode,
-                    AVG(temp) AS temp,
-                    AVG(humid) AS humid,
-                    AVG(co2) AS co2,
-                    AVG(voc) AS voc,
-                    AVG(fan_speed) as fan_speed
-                FROM sensor_data_interlock
-                WHERE timestamp BETWEEN ? AND ?
-                GROUP BY minute_th, sensor_type, operation_mode;
-                `
+        SELECT
+            strftime('%Y-%m-%d %H:%M:00', timestamp/1000, 'unixepoch', '+7 hours') AS minute_th,
+            sensor_type,
+            sensor_id,
+            operation_mode,
+            AVG(temp) AS temp,
+            AVG(humid) AS humid,
+            AVG(co2) AS co2,
+            AVG(voc) AS voc,
+            AVG(fan_speed) as fan_speed
+        FROM sensor_data_interlock
+        WHERE timestamp BETWEEN ? AND ?
+        GROUP BY minute_th, sensor_type, sensor_id, operation_mode;
+    `;
     const rows = db.prepare(query).all(startMs, endMs);
-    // console.log(rows);
+
     const parser = new Parser({
         fields: [
             'minute_th',
@@ -200,18 +342,18 @@ app.post("/download/interlock/csv", async (request, reply) => {
     const filepath = path.join('./', filename);
     fs.writeFileSync(filepath, csv);
 
-    // --- ส่งออกเป็นไฟล์ให้โหลด ---
     reply.header('Content-Type', 'text/csv');
     reply.header('Content-Disposition', `attachment; filename="${filename}"`);
     return reply.send(fs.createReadStream(filepath));
-    // return reply.status(200).send(rows)
-})
+});
 
+// -----------------------------------------
+// 8) POST /loop/data/iaq
+// -----------------------------------------
 app.post('/loop/data/iaq', async (request, reply) => {
-    const { start, latesttime, rangeSelected, adjustName } = request.body;
-    const db = new Database('./hlr_db.db');
-    const adjust = fetchSettingOrDefault(adjustName)
-    // CTE รวม 2 table ให้เป็นโครงเดียวกัน
+    const { start, latesttime, rangeSelected, adjustName } = request.body || {};
+    const adjust = fetchSettingOrDefault(adjustName);
+
     const MERGED_CTE = `
         WITH merged AS (
             SELECT
@@ -244,9 +386,6 @@ app.post('/loop/data/iaq', async (request, reply) => {
         let sql;
         let param;
 
-        // ─────────────────────────────────────────────
-        // 1) SWR: ดึงเฉพาะข้อมูลใหม่หลังจาก latesttime
-        // ─────────────────────────────────────────────
         if (latesttime > 0) {
             sql = `
                 ${MERGED_CTE}
@@ -256,9 +395,12 @@ app.post('/loop/data/iaq', async (request, reply) => {
                     sensor_id,
                     operation_mode AS mode,
                     CASE
-                        WHEN sensor_id = 'after_exhausts' THEN (${adjust.after_exhausts_plus} + (${adjust.after_exhausts_multiplier} * co2))+${adjust.after_exhausts_offset}
-                        WHEN sensor_id = 'before_exhaust' THEN (${adjust.before_exhausts_plus}  + (${adjust.before_exhaust_multiplier}* co2))+${adjust.before_exhaust_offset}
-                        WHEN sensor_id = 'interlock_4c' THEN (${adjust.interlock_4c_plus} + (${adjust.interlock_4c_multiplier} * co2))+${adjust.interlock_4c_offset}
+                        WHEN sensor_id = 'after_exhausts'
+                            THEN (${adjust.after_exhausts_plus} + (${adjust.after_exhausts_multiplier} * co2)) + ${adjust.after_exhausts_offset}
+                        WHEN sensor_id = 'before_exhaust'
+                            THEN (${adjust.before_exhaust_plus} + (${adjust.before_exhaust_multiplier} * co2)) + ${adjust.before_exhaust_offset}
+                        WHEN sensor_id = 'interlock_4c'
+                            THEN (${adjust.interlock_4c_plus} + (${adjust.interlock_4c_multiplier} * co2)) + ${adjust.interlock_4c_offset}
                         ELSE 0
                     END AS co2,
                     humid AS humidity,
@@ -271,12 +413,9 @@ app.post('/loop/data/iaq', async (request, reply) => {
             `;
             param = latesttime;
 
-            // ─────────────────────────────────────────────
-            // 2) ไม่มี latesttime → ใช้ start + rangeSelected
-            // ─────────────────────────────────────────────
         } else {
             if (rangeSelected >= 60400000) {
-                // ช่วงยาวมาก → bin 3 นาที
+                // bin 3 นาที
                 sql = `
                     ${MERGED_CTE}
                     SELECT
@@ -286,9 +425,12 @@ app.post('/loop/data/iaq', async (request, reply) => {
                         operation_mode AS mode,
                         AVG(
                             CASE
-                                WHEN sensor_id = 'after_exhausts' THEN (${adjust.after_exhausts_plus} + (${adjust.after_exhausts_multiplier} * co2))+${adjust.after_exhausts_offset}
-                                WHEN sensor_id = 'before_exhaust' THEN (${adjust.before_exhausts_plus}  + (${adjust.before_exhaust_multiplier}* co2))+${adjust.before_exhaust_offset}
-                                WHEN sensor_id = 'interlock_4c' THEN (${adjust.interlock_4c_plus} + (${adjust.interlock_4c_multiplier} * co2))+${adjust.interlock_4c_offset}
+                                WHEN sensor_id = 'after_exhausts'
+                                    THEN (${adjust.after_exhausts_plus} + (${adjust.after_exhausts_multiplier} * co2)) + ${adjust.after_exhausts_offset}
+                                WHEN sensor_id = 'before_exhaust'
+                                    THEN (${adjust.before_exhaust_plus} + (${adjust.before_exhaust_multiplier} * co2)) + ${adjust.before_exhaust_offset}
+                                WHEN sensor_id = 'interlock_4c'
+                                    THEN (${adjust.interlock_4c_plus} + (${adjust.interlock_4c_multiplier} * co2)) + ${adjust.interlock_4c_offset}
                                 ELSE 0
                             END
                         ) AS co2,
@@ -298,17 +440,13 @@ app.post('/loop/data/iaq', async (request, reply) => {
                         AVG(voc)        AS voc
                     FROM merged
                     WHERE timestamp >= ?
-                    GROUP BY
-                        1,  -- timestamp (bin แล้ว)
-                        2,  -- sensor_type
-                        3,  -- sensor_id
-                        4   -- mode
+                    GROUP BY 1,2,3,4
                     ORDER BY 1 ASC;
                 `;
                 param = start;
 
             } else if (rangeSelected >= 43200000) {
-                // 12–16 ชั่วโมง → bin 1 นาที
+                // bin 1 นาที
                 sql = `
                     ${MERGED_CTE}
                     SELECT
@@ -318,9 +456,12 @@ app.post('/loop/data/iaq', async (request, reply) => {
                         operation_mode AS mode,
                         AVG(
                             CASE
-                                WHEN sensor_id = 'after_exhausts' THEN (${adjust.after_exhausts_plus} + (${adjust.after_exhausts_multiplier} * co2))+${adjust.after_exhausts_offset}
-                                WHEN sensor_id = 'before_exhaust' THEN (${adjust.before_exhausts_plus}  + (${adjust.before_exhaust_multiplier}* co2))+${adjust.before_exhaust_offset}
-                                WHEN sensor_id = 'interlock_4c' THEN (${adjust.interlock_4c_plus} + (${adjust.interlock_4c_multiplier} * co2))+${adjust.interlock_4c_offset}
+                                WHEN sensor_id = 'after_exhausts'
+                                    THEN (${adjust.after_exhausts_plus} + (${adjust.after_exhausts_multiplier} * co2)) + ${adjust.after_exhausts_offset}
+                                WHEN sensor_id = 'before_exhaust'
+                                    THEN (${adjust.before_exhaust_plus} + (${adjust.before_exhaust_multiplier} * co2)) + ${adjust.before_exhaust_offset}
+                                WHEN sensor_id = 'interlock_4c'
+                                    THEN (${adjust.interlock_4c_plus} + (${adjust.interlock_4c_multiplier} * co2)) + ${adjust.interlock_4c_offset}
                                 ELSE 0
                             END
                         ) AS co2,
@@ -330,17 +471,13 @@ app.post('/loop/data/iaq', async (request, reply) => {
                         AVG(voc)        AS voc
                     FROM merged
                     WHERE timestamp >= ?
-                    GROUP BY
-                        1,  -- timestamp (bin แล้ว)
-                        2,  -- sensor_type
-                        3,  -- sensor_id
-                        4   -- mode
+                    GROUP BY 1,2,3,4
                     ORDER BY 1 ASC;
                 `;
                 param = start;
 
             } else {
-                // ช่วงสั้นกว่า 12 ชั่วโมง → ไม่ bin เวลา แต่ average ที่ timestamp เดียวกัน
+                // ไม่ bin เวลา
                 sql = `
                     ${MERGED_CTE}
                     SELECT
@@ -350,9 +487,12 @@ app.post('/loop/data/iaq', async (request, reply) => {
                         operation_mode AS mode,
                         AVG(
                             CASE
-                                WHEN sensor_id = 'after_exhausts' THEN (${adjust.after_exhausts_plus} + (${adjust.after_exhausts_multiplier} * co2))+${adjust.after_exhausts_offset}
-                                WHEN sensor_id = 'before_exhaust' THEN (${adjust.before_exhausts_plus}  + (${adjust.before_exhaust_multiplier}* co2))+${adjust.before_exhaust_offset}
-                                WHEN sensor_id = 'interlock_4c' THEN (${adjust.interlock_4c_plus} + (${adjust.interlock_4c_multiplier} * co2))+${adjust.interlock_4c_offset}
+                                WHEN sensor_id = 'after_exhausts'
+                                    THEN (${adjust.after_exhausts_plus} + (${adjust.after_exhausts_multiplier} * co2)) + ${adjust.after_exhausts_offset}
+                                WHEN sensor_id = 'before_exhaust'
+                                    THEN (${adjust.before_exhaust_plus} + (${adjust.before_exhaust_multiplier} * co2)) + ${adjust.before_exhaust_offset}
+                                WHEN sensor_id = 'interlock_4c'
+                                    THEN (${adjust.interlock_4c_plus} + (${adjust.interlock_4c_multiplier} * co2)) + ${adjust.interlock_4c_offset}
                                 ELSE 0
                             END
                         ) AS co2,
@@ -375,15 +515,16 @@ app.post('/loop/data/iaq', async (request, reply) => {
 
         const rows = db.prepare(sql).all(param);
         return reply.send(rows);
+
     } catch (err) {
         console.error('Error in /loop/data/iaq:', err);
         reply.status(500).send({ error: 'Internal server error' });
-    } finally {
-        db.close();
     }
 });
 
-
+// -----------------------------------------
+// 9) start server
+// -----------------------------------------
 app.listen({ port: 3011, host: '0.0.0.0' }, (err, address) => {
     if (err) {
         app.log.error(err)
